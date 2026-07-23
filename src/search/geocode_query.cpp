@@ -7,12 +7,22 @@
 #include <cmath>
 #include <iterator>
 #include <map>
+#include <optional>
+#include <queue>
 #include <set>
 #include <string_view>
 #include <tuple>
 #include <unordered_set>
 
 namespace osm::search {
+
+GeocodeQueryResult run_geocode_query_internal(
+    const DataStore& data,
+    const SearchIndex& index,
+    const std::string& input,
+    const GeocodeQueryOptions& options,
+    bool allow_nearest_intent);
+
 namespace {
 
 struct TokenSpan {
@@ -34,6 +44,12 @@ struct CandidateAccumulatorEntry {
 
 using CandidateMap = std::map<SearchObjectRef, CandidateAccumulatorEntry>;
 
+struct NearestCategoryIntent {
+    PoiCategory category{PoiCategory::Other};
+    std::string category_text;
+    std::string reference_query;
+};
+
 [[nodiscard]] double elapsed_ms(const std::chrono::steady_clock::time_point start, const std::chrono::steady_clock::time_point end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
@@ -44,8 +60,54 @@ using CandidateMap = std::map<SearchObjectRef, CandidateAccumulatorEntry>;
     });
 }
 
+[[nodiscard]] std::optional<PoiCategory> poi_category_from_query(std::string_view value) {
+    if (value == "shop" || value == "shops") return PoiCategory::Shop;
+    if (value == "restaurant" || value == "restaurants") return PoiCategory::Restaurant;
+    if (value == "cafe" || value == "cafes") return PoiCategory::Cafe;
+    if (value == "fast food" || value == "fastfood") return PoiCategory::FastFood;
+    if (value == "park" || value == "parks") return PoiCategory::Park;
+    if (value == "hotel" || value == "hotels") return PoiCategory::Hotel;
+    if (value == "school" || value == "schools") return PoiCategory::School;
+    if (value == "hospital" || value == "hospitals") return PoiCategory::Hospital;
+    if (value == "station" || value == "stations") return PoiCategory::Station;
+    return std::nullopt;
+}
+
 [[nodiscard]] bool is_single_letter_token(std::string_view token) {
     return token.size() == 1 && token[0] >= 'a' && token[0] <= 'z';
+}
+
+[[nodiscard]] bool is_weak_connector(std::string_view token) {
+    // These words may legitimately occur inside a complete name, but on their
+    // own they are far too common to be useful fallback search terms.
+    return token == "a" || token == "an" || token == "and" || token == "at" ||
+           token == "de" || token == "der" || token == "des" || token == "die" ||
+           token == "das" || token == "in" || token == "of" || token == "the" ||
+           token == "und" || token == "von" || token == "zu" || token == "zur" ||
+           token == "zum";
+}
+
+[[nodiscard]] bool has_meaningful_search_token(std::string_view normalized_name) {
+    const auto tokens = tokenizeNormalizedText(normalized_name);
+    return std::any_of(tokens.begin(), tokens.end(), [](const auto& token) {
+        return !is_weak_connector(token);
+    });
+}
+
+[[nodiscard]] int match_strategy_priority(const QueryMatchStrategy strategy) {
+    switch (strategy) {
+        case QueryMatchStrategy::Original: return 2;
+        // A literal substring hit is stronger evidence than an edit-distance
+        // guess. This also prevents incidental fuzzy neighbours from replacing
+        // deterministic prefix/interior completion.
+        case QueryMatchStrategy::Partial: return 1;
+        case QueryMatchStrategy::Fuzzy: return 0;
+    }
+    return 0;
+}
+
+[[nodiscard]] std::size_t posting_rarity_key(const std::size_t posting_count) {
+    return posting_count == 0 ? std::numeric_limits<std::size_t>::max() : posting_count;
 }
 
 [[nodiscard]] bool is_house_number_token(std::string_view token) {
@@ -93,6 +155,29 @@ using CandidateMap = std::map<SearchObjectRef, CandidateAccumulatorEntry>;
     return out;
 }
 
+[[nodiscard]] std::optional<NearestCategoryIntent> parse_nearest_category_intent(
+    const std::vector<std::string>& tokens) {
+    if (tokens.size() < 4 || (tokens.front() != "closest" && tokens.front() != "nearest")) {
+        return std::nullopt;
+    }
+    for (std::size_t connector = 2; connector + 1 < tokens.size(); ++connector) {
+        if (tokens[connector] != "to" && tokens[connector] != "near" && tokens[connector] != "from") {
+            continue;
+        }
+        const auto category_text = join_tokens(tokens, 1, connector);
+        const auto category = poi_category_from_query(category_text);
+        if (!category.has_value()) {
+            return std::nullopt;
+        }
+        return NearestCategoryIntent{
+            .category = *category,
+            .category_text = category_text,
+            .reference_query = join_tokens(tokens, connector + 1, tokens.size()),
+        };
+    }
+    return std::nullopt;
+}
+
 [[nodiscard]] bool spans_overlap(const std::size_t a_begin, const std::size_t a_end, const std::size_t b_begin, const std::size_t b_end) {
     return a_begin < b_end && b_begin < a_end;
 }
@@ -117,173 +202,181 @@ using CandidateMap = std::map<SearchObjectRef, CandidateAccumulatorEntry>;
     return spans;
 }
 
-[[nodiscard]] std::size_t edit_distance_bounded(std::string_view lhs, std::string_view rhs, const std::size_t max_distance) {
-    if (lhs == rhs) {
-        return 0;
-    }
-    const auto lhs_size = lhs.size();
-    const auto rhs_size = rhs.size();
-    const auto length_delta = lhs_size > rhs_size ? lhs_size - rhs_size : rhs_size - lhs_size;
-    if (length_delta > max_distance) {
-        return max_distance + 1;
-    }
-
-    std::vector<std::size_t> previous(rhs_size + 1);
-    std::vector<std::size_t> current(rhs_size + 1);
-    for (std::size_t j = 0; j <= rhs_size; ++j) {
-        previous[j] = j;
-    }
-
-    for (std::size_t i = 1; i <= lhs_size; ++i) {
-        current[0] = i;
-        std::size_t row_min = current[0];
-        for (std::size_t j = 1; j <= rhs_size; ++j) {
-            const auto substitution_cost = lhs[i - 1] == rhs[j - 1] ? 0U : 1U;
-            current[j] = std::min({
-                previous[j] + 1,
-                current[j - 1] + 1,
-                previous[j - 1] + substitution_cost,
-            });
-            row_min = std::min(row_min, current[j]);
-        }
-        if (row_min > max_distance) {
-            return max_distance + 1;
-        }
-        previous.swap(current);
-    }
-    return previous[rhs_size];
-}
-
 [[nodiscard]] std::size_t max_fuzzy_distance_for_token(std::string_view token) {
     if (token.size() < 3) {
         return 0;
     }
-    if (token.size() <= 6) {
+    if (token.size() <= 4) {
         return 1;
     }
-    return 2;
+    if (token.size() <= 7) {
+        return 2;
+    }
+    if (token.size() <= 11) {
+        return 3;
+    }
+    return 4;
 }
 
-[[nodiscard]] std::string best_fuzzy_token_match(const SearchIndex& index, std::string_view token) {
-    const auto max_distance = max_fuzzy_distance_for_token(token);
-    if (max_distance == 0 || has_digit(token)) {
-        return {};
-    }
-    if (index.token_index.find(std::string(token)) != index.token_index.end()) {
-        return {};
-    }
+struct TokenVariant {
+    std::vector<std::string> tokens;
+    std::size_t edit_cost{0};
+    std::size_t corrected_token_count{0};
+};
 
-    std::string best_token;
-    std::size_t best_distance = max_distance + 1;
-    std::size_t best_posting_count = 0;
-    auto consider_candidate = [&](const std::string& candidate, const std::size_t posting_count) {
-        if (candidate == token) {
-            best_token.clear();
-            best_distance = 0;
-            best_posting_count = posting_count;
-            return;
+[[nodiscard]] std::vector<TokenVariant> fuzzy_token_variants(const SearchIndex& index, const std::vector<std::string>& tokens) {
+    constexpr std::size_t kBeamWidth = 64;
+    constexpr std::size_t kMatchesPerKind = 4;
+    constexpr std::size_t kAlternativesPerToken = 12;
+    std::vector<TokenVariant> beam{{.tokens = tokens, .edit_cost = 0}};
+    for (std::size_t position = 0; position < tokens.size(); ++position) {
+        const auto& token = tokens[position];
+        const auto max_distance = max_fuzzy_distance_for_token(token);
+        if (max_distance == 0 || has_digit(token)) continue;
+        std::vector<FuzzyTokenMatch> alternatives;
+        for (const auto kind : {IndexedNameKind::Street, IndexedNameKind::Locality, IndexedNameKind::Poi, IndexedNameKind::Region}) {
+            auto typed = findFuzzyTokenMatches(index, token, kind, max_distance, kMatchesPerKind);
+            alternatives.insert(alternatives.end(), typed.begin(), typed.end());
         }
-        const auto length_delta = token.size() > candidate.size() ? token.size() - candidate.size() : candidate.size() - token.size();
-        if (length_delta > max_distance) {
-            return;
+        std::sort(alternatives.begin(), alternatives.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.distance != rhs.distance) return lhs.distance < rhs.distance;
+            if (lhs.kind != rhs.kind) return static_cast<int>(lhs.kind) < static_cast<int>(rhs.kind);
+            return lhs.token < rhs.token;
+        });
+        alternatives.erase(std::unique(alternatives.begin(), alternatives.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.token == rhs.token;
+        }), alternatives.end());
+        alternatives.erase(std::remove_if(alternatives.begin(), alternatives.end(), [&](const auto& match) {
+            if (match.token == token) return true;
+            const auto longest = std::max(token.size(), match.token.size());
+            return longest > 0 && match.distance * 100 > longest * 45;
+        }), alternatives.end());
+        if (alternatives.size() > kAlternativesPerToken) alternatives.resize(kAlternativesPerToken);
+        if (alternatives.empty()) continue;
+        std::vector<TokenVariant> next;
+        for (const auto& current : beam) {
+            // Keeping the original token allows one bad token to be corrected
+            // without forcing every unknown token in the query to change.
+            next.push_back(current);
+            for (const auto& alternative : alternatives) {
+                auto candidate = current;
+                candidate.tokens[position] = alternative.token;
+                candidate.edit_cost += alternative.distance;
+                ++candidate.corrected_token_count;
+                next.push_back(std::move(candidate));
+            }
         }
-        const auto distance = edit_distance_bounded(token, candidate, max_distance);
-        if (distance > max_distance) {
-            return;
-        }
-        if (distance < best_distance ||
-            (distance == best_distance && posting_count > best_posting_count) ||
-            (distance == best_distance && posting_count == best_posting_count && (best_token.empty() || candidate < best_token))) {
-            best_token = candidate;
-            best_distance = distance;
-            best_posting_count = posting_count;
-        }
-    };
-
-    for (const auto& [candidate, postings] : index.token_index) {
-        consider_candidate(candidate, postings.size());
-        if (best_distance == 0) {
-            return {};
-        }
+        std::sort(next.begin(), next.end(), [](const auto& lhs, const auto& rhs) {
+            if (lhs.edit_cost != rhs.edit_cost) return lhs.edit_cost < rhs.edit_cost;
+            if (lhs.corrected_token_count != rhs.corrected_token_count) {
+                return lhs.corrected_token_count > rhs.corrected_token_count;
+            }
+            return lhs.tokens < rhs.tokens;
+        });
+        next.erase(std::unique(next.begin(), next.end(), [](const auto& lhs, const auto& rhs) {
+            return lhs.tokens == rhs.tokens;
+        }), next.end());
+        if (next.size() > kBeamWidth) next.resize(kBeamWidth);
+        beam = std::move(next);
     }
+    beam.erase(std::remove_if(beam.begin(), beam.end(), [&](const auto& variant) { return variant.tokens == tokens; }), beam.end());
+    return beam;
+}
 
-    for (const auto& [address_key, postings] : index.address_index) {
-        const auto separator = address_key.find('|');
-        if (separator == std::string::npos) {
+[[nodiscard]] std::vector<std::vector<std::string>> semantic_token_variants(
+    const std::vector<std::string>& tokens) {
+    std::vector<std::vector<std::string>> variants;
+    std::vector<std::string> translated;
+    translated.reserve(tokens.size());
+    bool changed = false;
+    bool previous_was_institution = false;
+
+    for (const auto& token : tokens) {
+        if (token == "of" && previous_was_institution) {
+            changed = true;
+            previous_was_institution = false;
             continue;
         }
-        for (const auto& candidate : tokenizeNormalizedText(std::string_view{address_key}.substr(0, separator))) {
-            consider_candidate(candidate, postings.size());
-            if (best_distance == 0) {
-                return {};
+        if (token == "university" || token == "universities") {
+            translated.push_back("universitaet");
+            changed = true;
+            previous_was_institution = true;
+            continue;
+        }
+        translated.push_back(token);
+        previous_was_institution = false;
+    }
+
+    if (changed && !translated.empty() && translated != tokens) {
+        variants.push_back(translated);
+        // English institution names commonly use "University of <place>",
+        // while OSM names may use the German order "<place> Universität".
+        if (translated.size() == 2 && translated.front() == "universitaet") {
+            std::reverse(translated.begin(), translated.end());
+            variants.push_back(std::move(translated));
+        }
+    }
+    if (tokens.size() == 2 && tokens.front() == "universitaet") {
+        variants.push_back({tokens.back(), tokens.front()});
+    }
+    return variants;
+}
+
+[[nodiscard]] std::vector<std::vector<std::string>> partial_token_variants(
+    const SearchIndex& index,
+    const std::vector<std::string>& tokens) {
+    constexpr std::size_t kMaxPartialVariants = 16;
+    constexpr std::size_t kMatchesPerSpan = 8;
+    std::vector<std::vector<std::string>> variants;
+    std::set<std::vector<std::string>> seen;
+    const auto locality_spans = detect_locality_spans(index, tokens);
+    const auto house_spans = detect_house_spans(tokens);
+
+    for (std::size_t span_length = tokens.size(); span_length > 0 && variants.size() < kMaxPartialVariants; --span_length) {
+        for (std::size_t begin = 0; begin + span_length <= tokens.size() && variants.size() < kMaxPartialVariants; ++begin) {
+            const auto end = begin + span_length;
+            const bool overlaps_recognized_locality = std::any_of(locality_spans.begin(), locality_spans.end(), [&](const auto& span) {
+                return spans_overlap(begin, end, span.begin, span.end);
+            });
+            const bool overlaps_house_number = std::any_of(house_spans.begin(), house_spans.end(), [&](const auto& span) {
+                return spans_overlap(begin, end, span.begin, span.end);
+            });
+            if (overlaps_recognized_locality || overlaps_house_number) continue;
+            bool contains_number = false;
+            for (std::size_t i = begin; i < end; ++i) {
+                contains_number = contains_number || has_digit(tokens[i]);
+            }
+            if (contains_number) continue;
+
+            const auto fragment = join_tokens(tokens, begin, end);
+            if (fragment.size() < 2) continue;
+            if (!has_meaningful_search_token(fragment)) continue;
+            const auto matches = findSubstringNameMatches(
+                index,
+                fragment,
+                kMatchesPerSpan,
+                house_spans.empty() ? std::nullopt : std::optional{IndexedNameKind::Street});
+            for (const auto& match : matches) {
+                if (match.name_id >= index.names.size()) continue;
+                const auto& full_name = index.names[match.name_id].normalized_name;
+                if (full_name == fragment) continue;
+                if (has_digit(full_name)) continue;
+                const auto replacement = tokenizeNormalizedText(full_name);
+                if (replacement.empty()) continue;
+
+                std::vector<std::string> variant;
+                variant.reserve(tokens.size() - span_length + replacement.size());
+                variant.insert(variant.end(), tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(begin));
+                variant.insert(variant.end(), replacement.begin(), replacement.end());
+                variant.insert(variant.end(), tokens.begin() + static_cast<std::ptrdiff_t>(end), tokens.end());
+                if (variant != tokens && seen.insert(variant).second) {
+                    variants.push_back(std::move(variant));
+                    if (variants.size() >= kMaxPartialVariants) break;
+                }
             }
         }
     }
-    return best_token;
-}
-
-[[nodiscard]] bool is_partial_search_token(std::string_view token) {
-    return token.size() >= 2 && !has_digit(token);
-}
-
-[[nodiscard]] std::string best_partial_token_match(const SearchIndex& index, std::string_view token) {
-    if (!is_partial_search_token(token)) {
-        return {};
-    }
-    if (index.token_index.find(std::string(token)) != index.token_index.end()) {
-        return {};
-    }
-
-    std::string best_token;
-    std::size_t best_posting_count = 0;
-    auto consider_candidate = [&](const std::string& candidate, const std::size_t posting_count) {
-        if (candidate.size() <= token.size() || candidate.compare(0, token.size(), token) != 0) {
-            return;
-        }
-        if (posting_count > best_posting_count ||
-            (posting_count == best_posting_count && (best_token.empty() || candidate.size() < best_token.size())) ||
-            (posting_count == best_posting_count && candidate.size() == best_token.size() && candidate < best_token)) {
-            best_token = candidate;
-            best_posting_count = posting_count;
-        }
-    };
-
-    for (const auto& [candidate, postings] : index.token_index) {
-        consider_candidate(candidate, postings.size());
-    }
-
-    for (const auto& [address_key, postings] : index.address_index) {
-        const auto separator = address_key.find('|');
-        if (separator == std::string::npos) {
-            continue;
-        }
-        for (const auto& candidate : tokenizeNormalizedText(std::string_view{address_key}.substr(0, separator))) {
-            consider_candidate(candidate, postings.size());
-        }
-    }
-    return best_token;
-}
-
-[[nodiscard]] std::vector<std::string> fuzzy_correct_tokens(const SearchIndex& index, const std::vector<std::string>& tokens) {
-    std::vector<std::string> corrected = tokens;
-    for (auto& token : corrected) {
-        const auto replacement = best_fuzzy_token_match(index, token);
-        if (!replacement.empty()) {
-            token = replacement;
-        }
-    }
-    return corrected;
-}
-
-[[nodiscard]] std::vector<std::string> partial_complete_tokens(const SearchIndex& index, const std::vector<std::string>& tokens) {
-    std::vector<std::string> completed = tokens;
-    for (auto& token : completed) {
-        const auto replacement = best_partial_token_match(index, token);
-        if (!replacement.empty()) {
-            token = replacement;
-        }
-    }
-    return completed;
+    return variants;
 }
 
 [[nodiscard]] std::string house_number_from_span(const std::vector<std::string>& tokens, const TokenSpan& span) {
@@ -406,6 +499,7 @@ using CandidateMap = std::map<SearchObjectRef, CandidateAccumulatorEntry>;
 
     auto add_named = [&](const std::string& entity, const LocalitySpan* locality_span, const std::size_t unexplained) {
         if (entity.empty()) return;
+        if (!has_meaningful_search_token(entity)) return;
         QueryInterpretation interpretation;
         interpretation.intent = QueryIntent::NamedObject;
         interpretation.normalized_query = normalized_query;
@@ -472,7 +566,8 @@ void append_interpretations_for_tokens(
     const SearchIndex& index,
     const std::vector<std::string>& tokens,
     const QueryMatchStrategy strategy,
-    std::vector<QueryInterpretation>& interpretations) {
+    std::vector<QueryInterpretation>& interpretations,
+    const std::size_t edit_cost = 0) {
     const auto normalized_query = normalized_query_from_tokens(tokens);
     const auto house_spans = detect_house_spans(tokens);
     const auto locality_spans = detect_locality_spans(index, tokens);
@@ -480,13 +575,39 @@ void append_interpretations_for_tokens(
     auto named_interpretations = generate_named_interpretations(index, normalized_query, tokens, locality_spans);
     for (auto& interpretation : address_interpretations) {
         interpretation.match_strategy = strategy;
+        interpretation.edit_cost = edit_cost;
     }
     for (auto& interpretation : named_interpretations) {
         interpretation.match_strategy = strategy;
+        interpretation.edit_cost = edit_cost;
     }
     interpretations.reserve(interpretations.size() + address_interpretations.size() + named_interpretations.size());
     interpretations.insert(interpretations.end(), std::make_move_iterator(address_interpretations.begin()), std::make_move_iterator(address_interpretations.end()));
     interpretations.insert(interpretations.end(), std::make_move_iterator(named_interpretations.begin()), std::make_move_iterator(named_interpretations.end()));
+}
+
+void deduplicate_interpretations(std::vector<QueryInterpretation>& interpretations) {
+    using InterpretationKey = std::tuple<
+        QueryIntent,
+        QueryMatchStrategy,
+        std::string,
+        std::string,
+        std::vector<std::uint32_t>,
+        std::size_t,
+        std::size_t>;
+    std::set<InterpretationKey> seen;
+    interpretations.erase(
+        std::remove_if(interpretations.begin(), interpretations.end(), [&](const auto& interpretation) {
+            return !seen.emplace(
+                interpretation.intent,
+                interpretation.match_strategy,
+                interpretation.entity_name,
+                interpretation.normalized_house_number,
+                interpretation.locality_indices,
+                interpretation.unexplained_token_count,
+                interpretation.edit_cost).second;
+        }),
+        interpretations.end());
 }
 
 [[nodiscard]] std::vector<std::uint32_t> containing_region_indices_for_object(const DataStore& data, const SearchObjectRef& ref) {
@@ -612,7 +733,7 @@ struct LogicalRegion {
             lon = (data.streets[ref.index].bbox.min_lon + data.streets[ref.index].bbox.max_lon) / 2.0;
             return true;
         case SearchObjectType::Region:
-            if (ref.index >= data.regions.size()) return false;
+            if (ref.index >= data.regions.size() || data.regions[ref.index].points_count == 0) return false;
             lat = (data.regions[ref.index].bbox.min_lat + data.regions[ref.index].bbox.max_lat) / 2.0;
             lon = (data.regions[ref.index].bbox.min_lon + data.regions[ref.index].bbox.max_lon) / 2.0;
             return true;
@@ -631,6 +752,67 @@ struct LogicalRegion {
                      std::sin(dlon / 2.0) * std::sin(dlon / 2.0);
     const double c = 2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
     return earth_radius_m * c;
+}
+
+[[nodiscard]] double cell_distance_lower_bound_m(
+    const double query_lat,
+    const double query_lon,
+    const GridCellKey cell,
+    const float cell_size_deg) {
+    constexpr double earth_radius_m = 6371000.0;
+    constexpr double pi = 3.14159265358979323846;
+    const auto to_rad = [](const double deg) { return deg * pi / 180.0; };
+    const double scale = static_cast<double>(cell_size_deg);
+    const double min_lat = static_cast<double>(cell.y) * scale;
+    const double max_lat = static_cast<double>(cell.y + 1) * scale;
+    const double min_lon = static_cast<double>(cell.x) * scale;
+    const double max_lon = static_cast<double>(cell.x + 1) * scale;
+
+    double lon_delta = 0.0;
+    if (query_lon < min_lon) lon_delta = min_lon - query_lon;
+    else if (query_lon > max_lon) lon_delta = query_lon - max_lon;
+    lon_delta = std::min(lon_delta, 360.0 - std::min(lon_delta, 360.0));
+
+    const double query_lat_rad = to_rad(query_lat);
+    const double lon_delta_rad = to_rad(lon_delta);
+    const double a = std::sin(query_lat_rad);
+    const double b = std::cos(query_lat_rad) * std::cos(lon_delta_rad);
+    const double unconstrained_lat = std::atan2(a, b);
+    const double min_lat_rad = to_rad(min_lat);
+    const double max_lat_rad = to_rad(max_lat);
+    const double closest_lat = std::clamp(unconstrained_lat, min_lat_rad, max_lat_rad);
+    const double max_dot = std::clamp(
+        a * std::sin(closest_lat) + b * std::cos(closest_lat),
+        -1.0,
+        1.0);
+    return earth_radius_m * std::acos(max_dot);
+}
+
+[[nodiscard]] std::string object_label(const DataStore& data, const SearchObjectRef& ref) {
+    const auto resolve = [&](const StringId id) -> std::string {
+        return id != kInvalidStringId && id < data.strings.size() ? data.strings.resolve(id) : std::string{};
+    };
+    switch (ref.type) {
+        case SearchObjectType::House: {
+            if (ref.index >= data.houses.size()) return {};
+            const auto& house = data.houses[ref.index];
+            auto label = resolve(house.street_name_id);
+            const auto number = resolve(house.house_number_id);
+            const auto city = resolve(house.city_id);
+            if (!number.empty()) label += (label.empty() ? "" : " ") + number;
+            if (!city.empty()) label += (label.empty() ? "" : ", ") + city;
+            return label;
+        }
+        case SearchObjectType::Poi:
+            return ref.index < data.pois.size() ? resolve(data.pois[ref.index].name_id) : std::string{};
+        case SearchObjectType::Locality:
+            return ref.index < data.localities.size() ? resolve(data.localities[ref.index].name_id) : std::string{};
+        case SearchObjectType::Street:
+            return ref.index < data.streets.size() ? resolve(data.streets[ref.index].name_id) : std::string{};
+        case SearchObjectType::Region:
+            return ref.index < data.regions.size() ? resolve(data.regions[ref.index].name_id) : std::string{};
+    }
+    return {};
 }
 
 [[nodiscard]] double best_distance_to_locality_m(const DataStore& data, const QueryInterpretation& interpretation, const SearchObjectRef& ref) {
@@ -652,21 +834,29 @@ void improve_candidate(CandidateMap& candidates, GeocodeCandidate candidate, con
     auto [it, inserted] = candidates.emplace(candidate.ref, CandidateAccumulatorEntry{.candidate = candidate, .specificity = specificity});
     if (inserted) return;
     auto& current = it->second;
-    const auto current_tuple = std::make_tuple(
-        current.candidate.exact_address_match,
-        current.candidate.exact_name_match,
-        current.candidate.locality_recognized,
-        current.specificity,
-        -static_cast<long long>(current.candidate.unexplained_token_count),
-        -current.candidate.distance_to_locality_m);
-    const auto next_tuple = std::make_tuple(
-        candidate.exact_address_match,
-        candidate.exact_name_match,
-        candidate.locality_recognized,
-        specificity,
-        -static_cast<long long>(candidate.unexplained_token_count),
-        -candidate.distance_to_locality_m);
-    if (next_tuple > current_tuple) {
+    const auto better = [&](const GeocodeCandidate& lhs, const int lhs_specificity,
+                            const GeocodeCandidate& rhs, const int rhs_specificity) {
+        if (lhs.exact_address_match != rhs.exact_address_match) return lhs.exact_address_match;
+        if (lhs.exact_name_match != rhs.exact_name_match) return lhs.exact_name_match;
+        if (lhs.unexplained_token_count != rhs.unexplained_token_count) {
+            return lhs.unexplained_token_count < rhs.unexplained_token_count;
+        }
+        const auto lhs_strategy = match_strategy_priority(lhs.match_strategy);
+        const auto rhs_strategy = match_strategy_priority(rhs.match_strategy);
+        if (lhs_strategy != rhs_strategy) return lhs_strategy > rhs_strategy;
+        if (lhs.exact_name_match && rhs.exact_name_match &&
+            lhs.matched_entity_token_count != rhs.matched_entity_token_count) {
+            return lhs.matched_entity_token_count > rhs.matched_entity_token_count;
+        }
+        if (lhs.locality_recognized != rhs.locality_recognized) return lhs.locality_recognized;
+        if (lhs_specificity != rhs_specificity) return lhs_specificity > rhs_specificity;
+        if (lhs.edit_cost != rhs.edit_cost) return lhs.edit_cost < rhs.edit_cost;
+        const auto lhs_rarity = posting_rarity_key(lhs.source_name_postings);
+        const auto rhs_rarity = posting_rarity_key(rhs.source_name_postings);
+        if (lhs_rarity != rhs_rarity) return lhs_rarity < rhs_rarity;
+        return lhs.distance_to_locality_m < rhs.distance_to_locality_m;
+    };
+    if (better(candidate, specificity, current.candidate, current.specificity)) {
         current = CandidateAccumulatorEntry{.candidate = candidate, .specificity = specificity};
     }
 }
@@ -674,6 +864,7 @@ void improve_candidate(CandidateMap& candidates, GeocodeCandidate candidate, con
 void enrich_candidate_with_locality(const DataStore& data, const QueryInterpretation& interpretation, GeocodeCandidate& candidate) {
     candidate.locality_recognized = !interpretation.locality_indices.empty();
     candidate.unexplained_token_count = interpretation.unexplained_token_count;
+    candidate.matched_entity_token_count = tokenizeNormalizedText(interpretation.entity_name).size();
     candidate.distance_to_locality_m = best_distance_to_locality_m(data, interpretation, candidate.ref);
 
     if (interpretation.locality_indices.empty()) {
@@ -709,6 +900,8 @@ void retrieve_address_candidates(const DataStore& data, const SearchIndex& index
         candidate.interpretation_index = interpretation_index;
         candidate.match_strategy = interpretation.match_strategy;
         candidate.exact_address_match = true;
+        candidate.edit_cost = interpretation.edit_cost;
+        candidate.source_name_postings = interpretation.raw_candidate_count;
         enrich_candidate_with_locality(data, interpretation, candidate);
         improve_candidate(candidates, candidate, regionSpecificity(candidate.shared_admin_level));
     }
@@ -742,6 +935,8 @@ void retrieve_named_candidates(const DataStore& data, const SearchIndex& index, 
         candidate.interpretation_index = interpretation_index;
         candidate.match_strategy = interpretation.match_strategy;
         candidate.exact_name_match = exact;
+        candidate.edit_cost = interpretation.edit_cost;
+        candidate.source_name_postings = interpretation.raw_candidate_count;
         enrich_candidate_with_locality(data, interpretation, candidate);
         improve_candidate(candidates, candidate, regionSpecificity(candidate.shared_admin_level));
     }
@@ -752,11 +947,283 @@ void retrieve_named_candidates(const DataStore& data, const SearchIndex& index, 
     const auto rhs_spec = regionSpecificity(rhs.shared_admin_level);
     if (lhs.exact_address_match != rhs.exact_address_match) return lhs.exact_address_match > rhs.exact_address_match;
     if (lhs.exact_name_match != rhs.exact_name_match) return lhs.exact_name_match > rhs.exact_name_match;
+    if (lhs.unexplained_token_count != rhs.unexplained_token_count) return lhs.unexplained_token_count < rhs.unexplained_token_count;
+    const auto lhs_strategy = match_strategy_priority(lhs.match_strategy);
+    const auto rhs_strategy = match_strategy_priority(rhs.match_strategy);
+    if (lhs_strategy != rhs_strategy) return lhs_strategy > rhs_strategy;
+    if (lhs.exact_name_match && rhs.exact_name_match &&
+        lhs.matched_entity_token_count != rhs.matched_entity_token_count) {
+        return lhs.matched_entity_token_count > rhs.matched_entity_token_count;
+    }
     if (lhs.locality_recognized != rhs.locality_recognized) return lhs.locality_recognized > rhs.locality_recognized;
     if (lhs_spec != rhs_spec) return lhs_spec > rhs_spec;
-    if (lhs.unexplained_token_count != rhs.unexplained_token_count) return lhs.unexplained_token_count < rhs.unexplained_token_count;
+    if (lhs.edit_cost != rhs.edit_cost) return lhs.edit_cost < rhs.edit_cost;
+    const auto lhs_rarity = posting_rarity_key(lhs.source_name_postings);
+    const auto rhs_rarity = posting_rarity_key(rhs.source_name_postings);
+    if (lhs_rarity != rhs_rarity) return lhs_rarity < rhs_rarity;
+    if (lhs.in_viewport != rhs.in_viewport) return lhs.in_viewport > rhs.in_viewport;
+    if (lhs.distance_to_viewport_center_m != rhs.distance_to_viewport_center_m) {
+        return lhs.distance_to_viewport_center_m < rhs.distance_to_viewport_center_m;
+    }
     if (lhs.distance_to_locality_m != rhs.distance_to_locality_m) return lhs.distance_to_locality_m < rhs.distance_to_locality_m;
     return lhs.ref < rhs.ref;
+}
+
+void apply_viewport_evidence(
+    const DataStore& data,
+    const std::optional<BBox>& viewport,
+    GeocodeCandidate& candidate) {
+    if (!viewport.has_value()) return;
+    double lat = 0.0;
+    double lon = 0.0;
+    if (!object_coordinate(data, candidate.ref, lat, lon)) return;
+    candidate.in_viewport = viewport->contains(lon, lat);
+    const double center_lat = (viewport->min_lat + viewport->max_lat) * 0.5;
+    const double center_lon = (viewport->min_lon + viewport->max_lon) * 0.5;
+    candidate.distance_to_viewport_center_m = haversine_m(center_lat, center_lon, lat, lon);
+}
+
+void apply_viewport_result_policy(
+    const std::optional<BBox>& viewport,
+    GeocodeQueryResult& result) {
+    result.viewport_applied = viewport.has_value();
+    result.global_candidate_count = result.ranked_candidates.size();
+    if (!viewport.has_value() || result.ranked_candidates.empty()) return;
+
+    result.in_viewport_candidate_count = static_cast<std::size_t>(std::count_if(
+        result.ranked_candidates.begin(),
+        result.ranked_candidates.end(),
+        [](const auto& candidate) { return candidate.in_viewport; }));
+
+    if (result.in_viewport_candidate_count == 0) {
+        // The optional task explicitly asks what happens when the current view
+        // has no matches. Keep the globally ranked list and make that fallback
+        // visible to API/UI consumers instead of returning an unexplained blank.
+        result.viewport_fallback = true;
+        return;
+    }
+
+    result.ranked_candidates.erase(
+        std::remove_if(
+            result.ranked_candidates.begin(),
+            result.ranked_candidates.end(),
+            [](const auto& candidate) { return !candidate.in_viewport; }),
+        result.ranked_candidates.end());
+    result.viewport_filtered = result.ranked_candidates.size() < result.global_candidate_count;
+}
+
+void record_corrected_query(GeocodeQueryResult& result) {
+    if (result.ranked_candidates.empty()) return;
+    const auto& best = result.ranked_candidates.front();
+    if (best.match_strategy != QueryMatchStrategy::Fuzzy ||
+        best.interpretation_index >= result.interpretations.size()) {
+        return;
+    }
+    const auto& corrected = result.interpretations[best.interpretation_index].normalized_query;
+    if (!corrected.empty() && corrected != result.normalized_query) {
+        result.corrected_query = corrected;
+    }
+}
+
+void build_result_clusters(
+    const DataStore& data,
+    const double threshold_m,
+    GeocodeQueryResult& result) {
+    const auto count = result.ranked_candidates.size();
+    if (count == 0) return;
+
+    std::vector<double> lats(count, 0.0);
+    std::vector<double> lons(count, 0.0);
+    std::vector<bool> has_coordinate(count, false);
+    for (std::size_t i = 0; i < count; ++i) {
+        has_coordinate[i] = object_coordinate(data, result.ranked_candidates[i].ref, lats[i], lons[i]);
+        if (!has_coordinate[i]) continue;
+        if (!result.result_bounds.has_value()) {
+            result.result_bounds = BBox{.min_lon = lons[i], .min_lat = lats[i], .max_lon = lons[i], .max_lat = lats[i]};
+        } else {
+            result.result_bounds->min_lon = std::min(result.result_bounds->min_lon, lons[i]);
+            result.result_bounds->min_lat = std::min(result.result_bounds->min_lat, lats[i]);
+            result.result_bounds->max_lon = std::max(result.result_bounds->max_lon, lons[i]);
+            result.result_bounds->max_lat = std::max(result.result_bounds->max_lat, lats[i]);
+        }
+    }
+
+    std::vector<std::size_t> parent(count);
+    for (std::size_t i = 0; i < count; ++i) parent[i] = i;
+    const auto find_root = [&](std::size_t value, auto&& self) -> std::size_t {
+        if (parent[value] != value) parent[value] = self(parent[value], self);
+        return parent[value];
+    };
+    const auto unite = [&](const std::size_t lhs, const std::size_t rhs) {
+        const auto lhs_root = find_root(lhs, find_root);
+        const auto rhs_root = find_root(rhs, find_root);
+        if (lhs_root == rhs_root) return;
+        parent[std::max(lhs_root, rhs_root)] = std::min(lhs_root, rhs_root);
+    };
+    if (threshold_m >= 0.0) {
+        for (std::size_t i = 0; i < count; ++i) {
+            if (!has_coordinate[i]) continue;
+            for (std::size_t j = i + 1; j < count; ++j) {
+                if (has_coordinate[j] && haversine_m(lats[i], lons[i], lats[j], lons[j]) <= threshold_m) {
+                    unite(i, j);
+                }
+            }
+        }
+    }
+
+    std::map<std::size_t, std::vector<std::size_t>> members_by_root;
+    for (std::size_t i = 0; i < count; ++i) {
+        members_by_root[find_root(i, find_root)].push_back(i);
+    }
+    result.clusters.reserve(members_by_root.size());
+    for (auto& [_, members] : members_by_root) {
+        GeocodeCluster cluster;
+        cluster.representative_candidate_index = members.front();
+        cluster.member_candidate_indices = std::move(members);
+        std::size_t coordinate_count = 0;
+        for (const auto member : cluster.member_candidate_indices) {
+            if (!has_coordinate[member]) continue;
+            cluster.lat += lats[member];
+            cluster.lon += lons[member];
+            ++coordinate_count;
+        }
+        if (coordinate_count > 0) {
+            cluster.lat /= static_cast<double>(coordinate_count);
+            cluster.lon /= static_cast<double>(coordinate_count);
+        }
+        result.clusters.push_back(std::move(cluster));
+    }
+    std::sort(result.clusters.begin(), result.clusters.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.representative_candidate_index < rhs.representative_candidate_index;
+    });
+}
+
+void run_nearest_category_query(
+    const DataStore& data,
+    const SearchIndex& index,
+    const NearestCategoryIntent& intent,
+    const GeocodeQueryOptions& options,
+    GeocodeQueryResult& result) {
+    result.nearest_category_intent = true;
+    result.viewport = options.viewport;
+    result.nearest_category = intent.category;
+    result.reference_query = intent.reference_query;
+    QueryInterpretation interpretation;
+    interpretation.intent = QueryIntent::NearestCategory;
+    interpretation.normalized_query = result.normalized_query;
+    interpretation.tokens = tokenizeNormalizedText(result.normalized_query);
+    interpretation.entity_name = intent.category_text;
+    result.interpretations.push_back(std::move(interpretation));
+
+    GeocodeQueryOptions reference_options = options;
+    reference_options.max_ranked_candidates = 20;
+    const auto reference = run_geocode_query_internal(
+        data,
+        index,
+        intent.reference_query,
+        reference_options,
+        false);
+    const auto usable_reference = std::find_if(
+        reference.ranked_candidates.begin(),
+        reference.ranked_candidates.end(),
+        [&](const GeocodeCandidate& candidate) {
+            double lat = 0.0;
+            double lon = 0.0;
+            return candidate.unexplained_token_count == 0 &&
+                   (candidate.exact_address_match || candidate.exact_name_match) &&
+                   object_coordinate(data, candidate.ref, lat, lon);
+        });
+    if (usable_reference == reference.ranked_candidates.end() ||
+        !object_coordinate(data, usable_reference->ref, result.reference_lat, result.reference_lon)) {
+        result.failure_reason = "reference_not_resolved";
+        return;
+    }
+    result.reference_resolved = true;
+    result.reference_label = object_label(data, usable_reference->ref);
+
+    const auto& cells = index.poi_cells_by_category[static_cast<std::size_t>(intent.category)];
+    if (cells.empty()) {
+        result.failure_reason = "category_has_no_pois";
+        return;
+    }
+
+    struct CellEntry {
+        double lower_bound_m{0.0};
+        GridCellKey key{};
+    };
+    const auto farther_cell = [](const CellEntry& lhs, const CellEntry& rhs) {
+        if (lhs.lower_bound_m != rhs.lower_bound_m) return lhs.lower_bound_m > rhs.lower_bound_m;
+        if (lhs.key.x != rhs.key.x) return lhs.key.x > rhs.key.x;
+        return lhs.key.y > rhs.key.y;
+    };
+    std::priority_queue<CellEntry, std::vector<CellEntry>, decltype(farther_cell)> pending_cells(farther_cell);
+    for (const auto& [key, _] : cells) {
+        pending_cells.push(CellEntry{
+            .lower_bound_m = cell_distance_lower_bound_m(
+                result.reference_lat,
+                result.reference_lon,
+                key,
+                data.grid.cell_size_deg),
+            .key = key,
+        });
+    }
+
+    struct PoiDistance {
+        double distance_m{0.0};
+        std::uint32_t poi_index{0};
+    };
+    const auto nearer_poi = [](const PoiDistance& lhs, const PoiDistance& rhs) {
+        if (lhs.distance_m != rhs.distance_m) return lhs.distance_m < rhs.distance_m;
+        return lhs.poi_index < rhs.poi_index;
+    };
+    std::priority_queue<PoiDistance, std::vector<PoiDistance>, decltype(nearer_poi)> best_pois(nearer_poi);
+    const std::size_t limit = options.max_ranked_candidates;
+
+    while (!pending_cells.empty()) {
+        const auto cell = pending_cells.top();
+        if (limit > 0 && best_pois.size() >= limit && cell.lower_bound_m > best_pois.top().distance_m) {
+            break;
+        }
+        pending_cells.pop();
+        ++result.spatial_cells_examined;
+        const auto found = cells.find(cell.key);
+        if (found == cells.end()) continue;
+        for (const auto poi_index : found->second) {
+            if (poi_index >= data.pois.size() || data.pois[poi_index].category != intent.category) continue;
+            ++result.spatial_pois_tested;
+            const auto& poi = data.pois[poi_index];
+            const PoiDistance candidate{
+                .distance_m = haversine_m(result.reference_lat, result.reference_lon, poi.lat, poi.lon),
+                .poi_index = poi_index,
+            };
+            if (limit == 0 || best_pois.size() < limit) {
+                best_pois.push(candidate);
+            } else if (nearer_poi(candidate, best_pois.top())) {
+                best_pois.pop();
+                best_pois.push(candidate);
+            }
+        }
+    }
+
+    std::vector<PoiDistance> ordered;
+    ordered.reserve(best_pois.size());
+    while (!best_pois.empty()) {
+        ordered.push_back(best_pois.top());
+        best_pois.pop();
+    }
+    std::sort(ordered.begin(), ordered.end(), nearer_poi);
+    result.ranked_candidates.reserve(ordered.size());
+    for (const auto& match : ordered) {
+        GeocodeCandidate candidate;
+        candidate.ref = SearchObjectRef{.type = SearchObjectType::Poi, .index = match.poi_index};
+        candidate.interpretation_index = 0;
+        candidate.nearest_distance_m = match.distance_m;
+        apply_viewport_evidence(data, options.viewport, candidate);
+        result.ranked_candidates.push_back(candidate);
+    }
+    if (result.ranked_candidates.empty()) result.failure_reason = "category_has_no_pois";
+    apply_viewport_result_policy(options.viewport, result);
+    build_result_clusters(data, options.cluster_threshold_m, result);
 }
 
 } // namespace
@@ -765,6 +1232,7 @@ const char* queryIntentName(const QueryIntent intent) {
     switch (intent) {
         case QueryIntent::Address: return "Address";
         case QueryIntent::NamedObject: return "NamedObject";
+        case QueryIntent::NearestCategory: return "NearestCategory";
         case QueryIntent::Unknown: return "Unknown";
     }
     return "Unknown";
@@ -788,14 +1256,16 @@ int regionSpecificity(const std::int32_t admin_level) {
     }
 }
 
-GeocodeQueryResult runGeocodeQuery(
+GeocodeQueryResult run_geocode_query_internal(
     const DataStore& data,
     const SearchIndex& index,
     const std::string& input,
-    const GeocodeQueryOptions& options) {
+    const GeocodeQueryOptions& options,
+    const bool allow_nearest_intent) {
     const auto total_start = std::chrono::steady_clock::now();
     GeocodeQueryResult result;
     result.input = input;
+    result.viewport = options.viewport;
 
     const auto norm_start = std::chrono::steady_clock::now();
     result.normalized_query = normalizeSearchText(input);
@@ -803,22 +1273,43 @@ GeocodeQueryResult runGeocodeQuery(
     const auto norm_end = std::chrono::steady_clock::now();
     result.timings.normalization_ms = elapsed_ms(norm_start, norm_end);
 
+    if (allow_nearest_intent) {
+        const auto nearest_intent = parse_nearest_category_intent(tokens);
+        if (nearest_intent.has_value()) {
+            const auto interp_start = std::chrono::steady_clock::now();
+            run_nearest_category_query(data, index, *nearest_intent, options, result);
+            const auto end = std::chrono::steady_clock::now();
+            result.timings.interpretation_ms = elapsed_ms(interp_start, end);
+            result.timings.candidate_lookup_ms = result.timings.interpretation_ms;
+            result.timings.total_ms = elapsed_ms(total_start, end);
+            return result;
+        }
+    }
+
     const auto interp_start = std::chrono::steady_clock::now();
     append_interpretations_for_tokens(index, tokens, QueryMatchStrategy::Original, result.interpretations);
-    const auto fuzzy_tokens = fuzzy_correct_tokens(index, tokens);
-    if (fuzzy_tokens != tokens) {
-        append_interpretations_for_tokens(index, fuzzy_tokens, QueryMatchStrategy::Fuzzy, result.interpretations);
+    for (const auto& semantic_tokens : semantic_token_variants(tokens)) {
+        append_interpretations_for_tokens(index, semantic_tokens, QueryMatchStrategy::Original, result.interpretations);
     }
-    const auto partial_tokens = partial_complete_tokens(index, tokens);
-    if (partial_tokens != tokens && partial_tokens != fuzzy_tokens) {
+    const auto fuzzy_variants = fuzzy_token_variants(index, tokens);
+    for (const auto& variant : fuzzy_variants) {
+        append_interpretations_for_tokens(index, variant.tokens, QueryMatchStrategy::Fuzzy, result.interpretations, variant.edit_cost);
+    }
+    for (const auto& partial_tokens : partial_token_variants(index, tokens)) {
         append_interpretations_for_tokens(index, partial_tokens, QueryMatchStrategy::Partial, result.interpretations);
     }
+    deduplicate_interpretations(result.interpretations);
     std::stable_sort(result.interpretations.begin(), result.interpretations.end(), [](const auto& lhs, const auto& rhs) {
         if (lhs.exact_address_key_match != rhs.exact_address_key_match) return lhs.exact_address_key_match > rhs.exact_address_key_match;
         if (lhs.exact_entity_name_match != rhs.exact_entity_name_match) return lhs.exact_entity_name_match > rhs.exact_entity_name_match;
         if (lhs.locality_indices.empty() != rhs.locality_indices.empty()) return !lhs.locality_indices.empty();
         if (lhs.unexplained_token_count != rhs.unexplained_token_count) return lhs.unexplained_token_count < rhs.unexplained_token_count;
-        if (lhs.raw_candidate_count != rhs.raw_candidate_count) return lhs.raw_candidate_count > rhs.raw_candidate_count;
+        const auto lhs_rarity = posting_rarity_key(lhs.raw_candidate_count);
+        const auto rhs_rarity = posting_rarity_key(rhs.raw_candidate_count);
+        if (lhs_rarity != rhs_rarity) return lhs_rarity < rhs_rarity;
+        const auto lhs_strategy = match_strategy_priority(lhs.match_strategy);
+        const auto rhs_strategy = match_strategy_priority(rhs.match_strategy);
+        if (lhs_strategy != rhs_strategy) return lhs_strategy > rhs_strategy;
         return lhs.entity_name < rhs.entity_name;
     });
     const auto interp_end = std::chrono::steady_clock::now();
@@ -841,16 +1332,28 @@ GeocodeQueryResult runGeocodeQuery(
     const auto ranking_start = std::chrono::steady_clock::now();
     result.ranked_candidates.reserve(candidates.size());
     for (auto& [_, entry] : candidates) {
+        apply_viewport_evidence(data, options.viewport, entry.candidate);
         result.ranked_candidates.push_back(std::move(entry.candidate));
     }
     std::sort(result.ranked_candidates.begin(), result.ranked_candidates.end(), candidate_less);
+    apply_viewport_result_policy(options.viewport, result);
     if (options.max_ranked_candidates > 0 && result.ranked_candidates.size() > options.max_ranked_candidates) {
         result.ranked_candidates.resize(options.max_ranked_candidates);
     }
+    record_corrected_query(result);
+    build_result_clusters(data, options.cluster_threshold_m, result);
     const auto ranking_end = std::chrono::steady_clock::now();
     result.timings.ranking_ms = elapsed_ms(ranking_start, ranking_end);
     result.timings.total_ms = elapsed_ms(total_start, ranking_end);
     return result;
+}
+
+GeocodeQueryResult runGeocodeQuery(
+    const DataStore& data,
+    const SearchIndex& index,
+    const std::string& input,
+    const GeocodeQueryOptions& options) {
+    return run_geocode_query_internal(data, index, input, options, true);
 }
 
 } // namespace osm::search

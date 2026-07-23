@@ -153,6 +153,19 @@ std::string candidate_postcode(const DataStore& data, const SearchObjectRef& ref
     return {};
 }
 
+void serialize_optional_bbox(std::ostringstream& out, const std::optional<BBox>& bbox) {
+    if (!bbox.has_value()) {
+        out << "null";
+        return;
+    }
+    out << '{'
+        << "\"min_lon\":" << bbox->min_lon << ','
+        << "\"min_lat\":" << bbox->min_lat << ','
+        << "\"max_lon\":" << bbox->max_lon << ','
+        << "\"max_lat\":" << bbox->max_lat
+        << '}';
+}
+
 std::string rank_reason(const search::GeocodeCandidate& candidate) {
     std::string reason;
     if (candidate.match_strategy == search::QueryMatchStrategy::Fuzzy) reason += "typo corrected";
@@ -709,6 +722,29 @@ std::string serialize_geocode_json(const DataStore& data, const search::GeocodeQ
     out << '{'
         << "\"query\":\"" << escape_json(result.input) << "\","
         << "\"normalized_query\":\"" << escape_json(result.normalized_query) << "\","
+        << "\"corrected_query\":\"" << escape_json(result.corrected_query) << "\","
+        << "\"nearest_category_intent\":" << (result.nearest_category_intent ? "true" : "false") << ','
+        << "\"nearest_category\":";
+    if (result.nearest_category.has_value()) out << '"' << poi_category_json(*result.nearest_category) << '"';
+    else out << "null";
+    out << ",\"viewport\":";
+    serialize_optional_bbox(out, result.viewport);
+    out << ",\"viewport_applied\":" << (result.viewport_applied ? "true" : "false")
+        << ",\"viewport_filtered\":" << (result.viewport_filtered ? "true" : "false")
+        << ",\"viewport_fallback\":" << (result.viewport_fallback ? "true" : "false")
+        << ",\"global_candidate_count\":" << result.global_candidate_count
+        << ",\"in_viewport_candidate_count\":" << result.in_viewport_candidate_count;
+    out << ",\"result_bounds\":";
+    serialize_optional_bbox(out, result.result_bounds);
+    out << ','
+        << "\"reference_resolved\":" << (result.reference_resolved ? "true" : "false") << ','
+        << "\"reference_query\":\"" << escape_json(result.reference_query) << "\","
+        << "\"reference_label\":\"" << escape_json(result.reference_label) << "\","
+        << "\"reference_lat\":" << result.reference_lat << ','
+        << "\"reference_lon\":" << result.reference_lon << ','
+        << "\"failure_reason\":\"" << escape_json(result.failure_reason) << "\","
+        << "\"spatial_cells_examined\":" << result.spatial_cells_examined << ','
+        << "\"spatial_pois_tested\":" << result.spatial_pois_tested << ','
         << "\"timing\":{"
         << "\"normalization_ms\":" << result.timings.normalization_ms << ','
         << "\"interpretation_ms\":" << result.timings.interpretation_ms << ','
@@ -755,12 +791,27 @@ std::string serialize_geocode_json(const DataStore& data, const search::GeocodeQ
             << "\"name\":\"" << escape_json(geocode_object_name(data, candidate.ref)) << "\","
             << "\"city\":\"" << escape_json(candidate_city(data, candidate.ref)) << "\","
             << "\"postcode\":\"" << escape_json(candidate_postcode(data, candidate.ref)) << "\","
+            << "\"category\":";
+        if (candidate.ref.type == SearchObjectType::Poi && candidate.ref.index < data.pois.size()) {
+            out << '"' << poi_category_json(data.pois[candidate.ref.index].category) << '"';
+        } else {
+            out << "null";
+        }
+        out << ','
             << "\"lat\":" << point.lat << ','
             << "\"lon\":" << point.lon << ','
             << "\"exact_address\":" << (candidate.exact_address_match ? "true" : "false") << ','
             << "\"exact_name\":" << (candidate.exact_name_match ? "true" : "false") << ','
             << "\"match_strategy\":\"" << search::queryMatchStrategyName(candidate.match_strategy) << "\","
             << "\"locality_recognized\":" << (candidate.locality_recognized ? "true" : "false") << ','
+            << "\"in_viewport\":" << (candidate.in_viewport ? "true" : "false") << ','
+            << "\"distance_to_viewport_center_m\":";
+        if (std::isfinite(candidate.distance_to_viewport_center_m)) out << candidate.distance_to_viewport_center_m;
+        else out << "null";
+        out << ",\"nearest_distance_m\":";
+        if (std::isfinite(candidate.nearest_distance_m)) out << candidate.nearest_distance_m;
+        else out << "null";
+        out << ','
             << "\"shared_relation\":\"" << escape_json(resolve_string_or_empty(data.strings, candidate.shared_relation_name_id)) << "\","
             << "\"shared_relation_id\":" << candidate.shared_relation_id << ','
             << "\"shared_admin_level\":" << candidate.shared_admin_level << ','
@@ -774,6 +825,24 @@ std::string serialize_geocode_json(const DataStore& data, const search::GeocodeQ
             << '}';
     }
 
+    out << "],\"clusters\":[";
+    bool first_cluster = true;
+    for (const auto& cluster : result.clusters) {
+        if (cluster.representative_candidate_index >= result.ranked_candidates.size()) continue;
+        if (!first_cluster) out << ',';
+        first_cluster = false;
+        out << '{'
+            << "\"representative_index\":" << cluster.representative_candidate_index << ','
+            << "\"lat\":" << cluster.lat << ','
+            << "\"lon\":" << cluster.lon << ','
+            << "\"member_count\":" << cluster.member_candidate_indices.size() << ','
+            << "\"member_indices\":[";
+        for (std::size_t i = 0; i < cluster.member_candidate_indices.size(); ++i) {
+            if (i > 0) out << ',';
+            out << cluster.member_candidate_indices[i];
+        }
+        out << "]}";
+    }
     out << "]}";
     return out.str();
 }
